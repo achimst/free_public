@@ -1,0 +1,266 @@
+#
+# Library fo backup functions
+#
+# -------------------------------------------------------------------------
+# Copyright (c) 2013, Achim Stumpf <achim dot stumpf at gmail dot com>
+# All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions
+# are met:
+#
+# * Redistributions of source code must retain the above copyright
+#   notice, this list of conditions and the following disclaimer.
+#
+# * Redistributions in binary form must reproduce the above copyright
+#   notice, this list of conditions and the following disclaimer in 
+#   the documentation and/or other materials provided with the distribution.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+# "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+# LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+# A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+# HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+# SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+# LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+# DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+# THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+# (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+# -------------------------------------------------------------------------
+#
+delete_backup_dir () {
+    local OLDBACKUP="$1"
+    local ERROR=0
+    local RET=""
+
+    if [ -e "$OLDBACKUP" ]; then
+        log "INFO: deleting old backup directory $OLDBACKUP"
+        rm -rf $OLDBACKUP
+        RET="$?"
+        if [ "$RET" -ne 0 ]; then
+            ERROR=1
+            log "FATAL: deleting of $OLDBACKUP failed: $RET" "crit"
+        fi
+    fi
+
+    return $ERROR
+}
+
+delete_backup_file () {
+    local OLDEST="$1"
+    local ERROR=0
+    local RET=""
+
+    if [ -e "$OLDEST" ]; then
+        log "INFO: deleting old backup file $OLDEST"
+        rm -f $OLDEST
+        RET="$?"
+        if [ "$RET" -ne 0 ]; then
+            ERROR=1
+            log "FATAL: rm $OLDEST failed: $RET" "crit"
+        fi
+    fi
+
+    return $ERROR
+}
+
+rotate_daily_backups () {
+    local TARGETDATADIR="$1"
+    # e.g. TODAY=2008-01-07
+    local TODAY="$2"
+    local KEEPMAXDAYS="$3"
+
+    delete_backup_dir "${TARGETDATADIR}/$(date --date="$TODAY -${KEEPMAXDAYS} days" "+%Y-%m-%d")"
+    return $?
+}
+
+rotate_backups_by_size () {
+    local TARGET="$1"
+    # MAXSIZE in Kbytes
+    local MAXSIZE="$(echo "$2*1024*1024" | bc)"
+    local OLDEST=""
+    local ERROR=0
+    local RET=""
+
+    while [ "$(du -c ${TARGET}* | tail -n1 | cut -f1)" -gt $MAXSIZE ]; do
+        OLDEST="$(ls -d -1 -t ${TARGET}* | tail -n1)"
+        if [ -d "$OLDEST" ]; then
+            delete_backup_dir "$OLDEST"
+            if [ "$?" -ne 0 ]; then
+                ERROR=1
+            fi
+        else
+            delete_backup_file "$OLDEST"
+            if [ "$?" -ne 0 ]; then
+                ERROR=1
+            fi
+        fi
+    done
+
+    return $ERROR
+}
+
+# verify .tgz file
+verify_tgz_file () {
+    local TGZFILE="$1"
+    local RET=""
+
+    if [ -e "$TGZFILE" ]; then
+        gzip -t $TGZFILE
+        RET="$?"
+        if [ "$RET" -eq 0 ]; then
+            log "INFO: .tgz file $i: verification succeeded"
+            return 0
+        else
+            log "ERROR: .tgz file $i: verification failed: $RET" "err"
+            return 1
+        fi  
+    else
+        log "ERROR: $TGZFILE not found" "err"
+        return 1
+    fi  
+}
+
+create_tgz_file () {
+    local EXCLUDE="$1"
+    local BACKUPDATA="$2"
+    local BACKUPFILE="$3"
+    local ERROR=0
+    local EXTMP=""
+    local PAT=""
+    local RET=""
+
+    for PAT in $EXCLUDE
+    do
+        EXTMP="$EXTMP --exclude=$PAT"
+    done
+    EXCLUDE="$EXTMP"
+    log "INFO: Excluding from backup: $EXCLUDE"
+
+    log "INFO: Backup of $BACKUPDATA to $BACKUPFILE"
+    tar $EXCLUDE -czf $BACKUPFILE $BACKUPDATA
+    RET="$?"
+    # exit code 1: If tar was given ‘--create’, ‘--append’ or ‘--update’ option, this exit code means that some files were changed while 
+    # being archived and so the resulting archive does not contain the exact copy of the file set.
+    # exit code 2: ‘Fatal error’. This means that some fatal, unrecoverable error occurred.
+    if [ "$RET" -eq 2 ]; then
+        ERROR=1
+        log "FATAL: tar failed: $RET" "crit"
+    fi
+
+    return $ERROR
+}
+
+encrypt_backup_file () {
+    local RECIPIENT="$1"
+    local BACKUPFILE="$2"
+    local ERROR=0
+    local RET=""
+
+    log "INFO: Starting encryption of ${BACKUPFILE} to ${BACKUPFILE}.dat"
+    gpg -r $RECIPIENT -o "${BACKUPFILE}.dat" --encrypt "${BACKUPFILE}"
+    RET="$?"
+    if [ "$RET" -ne 0 ]; then
+        ERROR=1
+        log "FATAL: Encryption failed: $RET" "crit"
+    fi
+
+    # remove old backupfile
+    rm ${BACKUPFILE} 
+    RET="$?"
+    if [ "$RET" -ne 0 ]; then
+        ERROR=1
+        log "ERROR: Removing file ${BACKUPFILE} failed: $RET" "err"
+    fi
+
+    return $ERROR
+}
+
+mysql_all_backup () {
+    local MYSQLUSER="$1"
+    local MYSQLPASS="$2"
+    local MYSQLDIR="$3"
+    local MYSQLFILEPREFIX="$4"
+    local MYSQL="mysql --user=$1 --password=$2"
+    local MYSQLDUMP="mysqldump --user=$1 --password=$2 --lock-all-tables --flush-logs --quick"
+    local DBNAMES=""
+    local DB=""
+    local ERROR=0
+    local RET=""
+
+    log "INFO: Starting MySQL Backup"
+    # backup of all databases in one file
+    $MYSQLDUMP --all-databases --result-file="${MYSQLDIR}/${MYSQLFILEPREFIX}all.sql"
+    RET="$?"
+    if [ "$RET" -ne 0 ]; then
+        ERROR=1
+        log "FATAL: all database backup failed: $RET" "crit"
+    fi
+
+    # backup all databases in single files
+    DBNAMES="$($MYSQL --batch --skip-column-names -e "show databases" | sed 's/ /%/g')"
+    for DB in $DBNAMES
+    do
+        $MYSQLDUMP --databases $DB --result-file="${MYSQLDIR}/${MYSQLFILEPREFIX}${DB}.sql"
+        RET="$?"
+        if [ "$RET" -ne 0 ]; then
+            ERROR=1
+            log "FATAL: database backup of db $DB failed: $RET" "crit"
+        fi
+    done
+
+    log "INFO: MySQL backup done..."
+    return $ERROR
+}
+
+libvirt_backup () {
+    local LIBVIRTDEST="$1"
+    local DOMAINS=""
+    local NETS=""
+    local POOLS=""
+    local ERROR=0
+    local RET=""
+    local I=""
+
+    log "INFO: Starting libvirt Backup"
+
+    # backup of active and inactive domain xml files
+    DOMAINS="$(virsh list --all | grep -v '^ Id Name' | grep -v '^--------' | awk '{ print $2 }')"
+    for I in $DOMAINS
+    do
+        virsh dumpxml $I > ${LIBVIRTDEST}/domain-${I}.xml
+        RET="$?"
+        if [ "$RET" -ne 0 ]; then
+            ERROR=1
+            log "FATAL: libvirt backup of domain ${I} failed: $RET" "crit"
+        fi
+    done
+
+    # backup of active and inactive network xml files
+    NETS="$(virsh net-list --all | grep -v '^Name' | grep -v '^--------' | awk '{ print $1 }')"
+    for I in $NETS
+    do
+        virsh net-dumpxml $I > ${LIBVIRTDEST}/net-${I}.xml
+        RET="$?"
+        if [ "$RET" -ne 0 ]; then
+            ERROR=1
+            log "FATAL: libvirt backup of network ${I} failed: $RET" "crit"
+        fi
+    done
+
+    # backup of active and inactive pool xml files
+    POOLS="$(virsh pool-list --all | grep -v '^Name' | grep -v '^--------' | awk '{ print $1 }')"
+    for I in $POOLS
+    do
+        virsh pool-dumpxml $I > ${LIBVIRTDEST}/pool-${I}.xml
+        RET="$?"
+        if [ "$RET" -ne 0 ]; then
+            ERROR=1
+            log "FATAL: libvirt backup of pool ${I} failed: $RET" "crit"
+        fi
+    done
+
+    log "INFO: libvirt backup done..."
+    return $ERROR
+}

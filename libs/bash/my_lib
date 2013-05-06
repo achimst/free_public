@@ -1,0 +1,307 @@
+#
+# Library for basic functions
+#
+# -------------------------------------------------------------------------
+# Copyright (c) 2013, Achim Stumpf <achim dot stumpf at gmail dot com>
+# All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions
+# are met:
+#
+# * Redistributions of source code must retain the above copyright
+#   notice, this list of conditions and the following disclaimer.
+#
+# * Redistributions in binary form must reproduce the above copyright
+#   notice, this list of conditions and the following disclaimer in 
+#   the documentation and/or other materials provided with the distribution.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+# "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+# LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+# A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+# HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+# SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+# LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+# DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+# THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+# (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+# -------------------------------------------------------------------------
+#
+# Variables set in function init_my_libs
+#
+# Global vars have to be configured
+#
+# $0 the process name
+__MY_PRGNAME=""
+#
+# the log directory
+__MY_LOGDIR=""
+# How long should logfiles remain
+__MY_KEEPLOGS=""
+# Debug yes/no
+# 0: stdout, stderr and logs to the logfile if it is configured
+# else dump to stdout and stderr
+__MY_DEBUG=""
+# syslog? 0=no, 1=yes
+__MY_SYSLOG=""
+#
+# local vars are prefixed with __MYPRV
+#
+__MYPRV_LOGFILE=""
+
+
+#
+# FUNCTIONS
+#
+init_my_libs () {
+    __MY_PRGNAME="$1"
+    __MY_LOGDIR="$2"
+    # log directory exists, log to logfile
+    if [ "$__MY_LOGDIR" != "" ]; then
+        __MYPRV_LOGFILE="$__MY_LOGDIR/log_$(date -u "+%Y-%m-%d")"
+    fi
+    __MY_KEEPLOGS="$3"
+    __MY_DEBUG="$4"
+    __MY_SYSLOG="$5"
+}
+
+include_config () {
+    # including configuration if it exists
+    if [ "$1" != "" ]; then
+        if [ -f "$1" ]; then
+            echo "using configuration file $1"
+            check_file_exit $1
+            . $1
+        else
+            echo "no configuration file $1 found: using defaults" >&2
+        fi
+    else
+        echo "no configuration file: using defaults"
+    fi
+}
+
+remove_old_files () {
+    local DEST="$1"
+    local REGEX="$2"
+    local NUMFILES="$(ls -1 "$DEST" | grep "$REGEX" | wc -l)"
+    local NUMDELFILES="$(($NUMFILES - $__MY_KEEPLOGS))"
+    local I=0
+    local RET=0
+
+    if [ "$NUMDELFILES" -gt 0 ]; then
+        for I in $(ls -1 "$DEST" | grep "$REGEX" | head -n $NUMDELFILES)
+        do
+            log "INFO: removing file: $DEST/$I"
+            unlink "$DEST/$I"
+            RET="$?"
+            if [ "$RET" -ne 0 ]; then
+                log "ERROR: removing file $DEST/$I failed: $RET" "err"
+            fi
+        done
+    fi
+}
+
+init_log () {
+    # logfile not defined, no logging 
+    if [ "$__MYPRV_LOGFILE" != "" ]; then
+        # logfile creation if no logfile is present
+        if [ ! -e "$__MYPRV_LOGFILE" ]; then
+            touch "$__MYPRV_LOGFILE"
+            if [ "$?" -ne 0 ]; then
+                exit 1
+            fi
+        fi
+        # logfile writeable?
+        if [ ! -w "$__MYPRV_LOGFILE" ]; then
+            echo "$0: logfile $__MYPRV_LOGFILE: no write permission granted" >&2
+            exit 1
+        fi
+
+        if [ "$__MY_DEBUG" = "0" ]; then
+            exec 6>&1           # Link file descriptor #6 with stdout.
+                                # Saves stdout.
+            exec >> $__MYPRV_LOGFILE    # stdout replaced with file $__MYPRV_LOGFILE.
+            exec 7>&2           # Link file descriptor #7 with stderr.
+                                # Saves stderr.
+            exec 2>> $__MYPRV_LOGFILE   # stderr replaced with file $__MYPRV_LOGFILE.
+        fi
+        # now only exit with stop_log (stdout and stderr restored)
+        log "INFO: removing older log files"
+        remove_old_files "$__MY_LOGDIR" "log_20[0-9][0-9]-[01][0-9]-[0123][0-9]"
+    else
+        echo "${__MY_PRGNAME}: logging to file is deactivated"
+    fi
+}
+
+stop_log () {
+    # no log directory exists, do not log to logfile
+    if [ "$__MYPRV_LOGFILE" != "" ]; then
+        if [ "$__MY_DEBUG" = "0" ]; then
+            # restore io redirection
+            exec 1>&6 6>&-      # Restore stdout and close file descriptor #6.
+            exec 2>&7 7>&-      # Restore stderr and close file descriptor #7.
+        fi
+    fi
+}
+
+log () {
+    local MSG="$1"
+    local PRIO="$2"
+    local FACILITY="$3"
+
+    if [ "$PRIO" = "" ]; then
+        PRIO="notice"
+    fi
+    if [ "$FACILITY" = "" ]; then
+        FACILITY="user"
+    fi
+
+    if [ "$__MYPRV_LOGFILE" != "" ]; then
+        if [ "$__MY_DEBUG" = "1" ]; then
+            echo "$(date -u "+%b %d %H:%M:%S") $MSG" >> $__MYPRV_LOGFILE
+        fi
+    fi
+    
+    if [ "$__MY_SYSLOG" = "1" ]; then
+        logger -i -t "$__MY_PRGNAME" -p ${FACILITY}.${PRIO} "$MSG"
+    fi
+
+    echo "$(date -u "+%b %d %H:%M:%S") $MSG"
+}
+
+mail_log () {
+    local SUBJECT="$1"
+    local MAILTO="$2"
+    local ERROR=0
+    local RET=""
+
+    log "INFO: sendind logfile $__MYPRV_LOGFILE via mail to $MAILTO"
+    cat "$__MYPRV_LOGFILE" | mail -s "$SUBJECT" "$MAILTO"
+    RET=$?
+    if [ "$RET" -ne 0 ]; then
+        ERROR=1
+        log "FATAL: sending mail failed: $RET" "crit"
+    fi
+
+    return $ERROR
+}
+
+check_dir_exit () {
+    if [ ! -d "$1" ]; then
+        echo "$__MY_PRGNAME: directory $1: does not exist" >&2
+        create_dir_exit $1
+    fi
+    if [ ! -r "$1" ]; then
+        echo "$__MY_PRGNAME: directory $1: cannot read directory: permission denied" >&2
+        exit 1
+    fi
+    if [ ! -w "$1" ]; then
+        echo "$__MY_PRGNAME: directory $1: has no write permission granted" >&2
+        exit 1
+    fi
+    if [ ! -x "$1" ]; then
+        echo "$__MY_PRGNAME: directory $1: has no execute/access permission granted" >&2
+        exit 1
+    fi
+}
+
+check_file_exit () {
+    if [ ! -f "$1" ]; then
+        echo "$__MY_PRGNAME: file $1: does not exist" >&2
+        exit 1
+    fi
+    if [ ! -s "$1" ]; then
+        echo "$__MY_PRGNAME: file $1: is an empty file" >&2
+        exit 1
+    fi
+    if [ ! -r "$1" ]; then
+        echo "$__MY_PRGNAME: file $1: cannot read file: permission denied" >&2
+        exit 1
+    fi
+}
+
+create_dir_exit () {
+    if [ ! -d "$1" ]; then
+        echo "$__MY_PRGNAME: creating directory $1"
+        mkdir $1
+        RET="$?"
+        if [ "$RET" -ne 0 ]; then
+            echo "$__MY_PRGNAME: cannot create directory $1: $RET" >&2
+            exit 1
+        fi
+    else
+        check_dir_exit $1
+    fi
+}
+
+create_dir () {
+# $1 = destination direcotry
+# $2 = file mode for chmod
+    if [ ! -d "$1" ]; then
+        log "INFO: creating directory $1"
+        mkdir $1
+        RET="$?"
+        if [ "$RET" -ne 0 ]; then
+            log "FATAL: cannot create directory $1: $RET" "crit"
+            return 1
+        fi
+        chmod $2 $1
+        RET="$?"
+        if [ "$RET" -ne 0 ]; then
+            log "FATAL: cannot chmod $2 $1: $RET" "crit"
+            return 1
+        fi
+    fi
+}
+
+write_pid_file () {
+    local RET=""
+    local PID="$1/${__MY_PRGNAME}.pid"
+
+    if [ ! -f "$PID" ]; then
+        echo "$$" > "$PID"
+        RET="$?"
+        if [ "$RET" -ne 0 ]; then
+            echo "$__MY_PRGNAME: writing PID file $PID failed: $RET" >&2
+            exit 1
+        fi
+    else
+        echo "$__MY_PRGNAME: PID file $PID already exists..." >&2
+        kill -0 $(cat $PID)
+        RET="$?"
+        if [ "$RET" -ne 0 ]; then
+            echo "$__MY_PRGNAME: PID $(cat $PID | tr -d '\n') does not run: creating new one" >&2
+            echo "$$" > "$PID"
+            RET="$?"
+            if [ "$RET" -ne 0 ]; then
+                echo "$__MY_PRGNAME: writing new PID file $PID failed: $RET" >&2
+                exit 1
+            fi
+        else    
+            echo "$__MY_PRGNAME: PID $(cat $PID | tr -d '\n') runs: not starting" >&2
+            exit 1
+        fi
+    fi
+}
+
+remove_pid_file () {
+    local RET=""
+    local PID="$1/${__MY_PRGNAME}.pid"
+
+    if [ -f "$PID" ]; then
+        rm "$PID"
+        RET="$?"
+        if [ "$RET" -ne 0 ]; then
+            log "ERROR: removing PID file $PID failed: $RET" "err"
+            return 1
+        fi
+    else
+        log "ERROR: PID file $PID does not exist: nothing to cleanup" "err"
+        return 1
+    fi
+
+    return 0
+}
+
