@@ -1,0 +1,29 @@
+# Set this options
+DEBUG="0"
+SYSLOG="1"
+KEEPLOGS="7"
+LOGDIR="$BASEDIR/logs/"
+# mail to $MAILTO, otherwise no mail is send
+MAILTO="root"
+BACKUPDIR="/private-backup/"
+BACKUPTMPDIR="${BACKUPDIR}/tmp/"
+BACKUPDATA="/etc /home /root /var/log /var/mail"
+# max size in GB
+BACKUPMAXSIZE=5
+# Exclude List
+EXCLUDE="/private-backup /bla"
+# Set to "YES", if you want to encrypt
+ENCRYPT=""
+# Encrypt for user id name of GPG 
+ENCRYPT_TO=""
+# Backup MySQL? - Set to "YES"
+MYSQL=""
+# Where does mysql backup write the backups? Relative to $BACKUPTMPDIR
+MYSQLDIR="mysql/"
+MYSQLUSER=""
+MYSQLPASS=""
+# Backup libvirt? - Set to "YES"
+LIBVIRT=""
+# Where does libvirt backup write the backups? Relative to $BACKUPTMPDIR
+LIBVIRTDIR="libvirt/"
+

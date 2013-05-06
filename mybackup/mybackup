@@ -1,0 +1,300 @@
+#!/bin/bash
+#
+# -------------------------------------------------------------------------
+# Copyright (c) 2013, Achim Stumpf <achim dot stumpf at gmail dot com>
+# All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions
+# are met:
+#
+# * Redistributions of source code must retain the above copyright
+#   notice, this list of conditions and the following disclaimer.
+#
+# * Redistributions in binary form must reproduce the above copyright
+#   notice, this list of conditions and the following disclaimer in 
+#   the documentation and/or other materials provided with the distribution.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+# "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+# LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+# A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+# HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+# SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+# LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+# DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+# THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+# (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+# -------------------------------------------------------------------------
+#
+BASEDIR="./"
+PRGNAME="$(basename $0)"
+BACKUPERROR=0
+BACKUPTIME=$(date "+%Y-%m-%d_%H-%M")
+HOST="$(/bin/hostname --fqdn)"
+BACKUPFILEPREFIX="backup-${HOST}-"
+BACKUPFILE="${BACKUPFILEPREFIX}${BACKUPTIME}.tgz"
+MYSQLFILEPREFIX="mysql-${BACKUPTIME}-"
+UMASK=$(umask)
+
+#
+# Default configuration options which can be changed in the configuration file $PRGNAME.cfg
+: ${DEBUG="0"}
+: ${SYSLOG="1"}
+: ${KEEPLOGS="7"}
+: ${LOGDIR="$BASEDIR/logs/"}
+# mail to $MAILTO, otherwise no mail is send
+: ${MAILTO=""}
+: ${BACKUPDIR="/private-backup/"}
+: ${BACKUPTMPDIR="${BACKUPDIR}/tmp/"}
+: ${BACKUPDATA="/etc /home /root /var/log /var/mail /var/www"}
+# max size in GB
+: ${BACKUPMAXSIZE=4}
+# Exclude List
+: ${EXCLUDE="/private-backup"}
+# Set to "YES", of you want to encrypt
+: ${ENCRYPT=""}
+# Encrypt for user id name of GPG 
+: ${ENCRYPT_TO=""}
+# Backup MySQL? - Set to "YES"
+: ${MYSQL=""}
+# Where does mysql backup write the backups? Relative to ${BACKUPTMPDIR}
+: ${MYSQLDIR="mysql/"}
+: ${MYSQLUSER=""}
+: ${MYSQLPASS=""}
+# Backup libvirt? - Set to "YES"
+: ${LIBVIRT=""}
+# Where does libvirt backup write the backups? Relative to ${BACKUPTMPDIR}
+: ${LIBVIRTDIR="libvirt/"}
+
+# include libs (see myrepos/trunk/libs/bash)
+. ${BASEDIR}/my_lib
+. ${BASEDIR}/my_lib_backup
+
+
+##################################################
+##################################################
+#
+# FUNCTIONS
+#
+##################################################
+##################################################
+
+dump_config () {
+    log "DEBUG=${DEBUG}"
+    log "SYSLOG=${SYSLOG}"
+    log "KEEPLOGS=${KEEPLOGS}"
+    log "LOGDIR=${LOGDIR}"
+    log "MAILTO=${MAILTO}"
+    log "BACKUPDIR=${BACKUPDIR}"
+    log "BACKUPTMPDIR=${BACKUPTMPDIR}"
+    log "BACKUPDATA=${BACKUPDATA}"
+    log "BACKUPMAXSIZE=${BACKUPMAXSIZE}"
+    log "EXCLUDE=${EXCLUDE}"
+    log "ENCRYPT=${ENCRYPT}"
+    log "ENCRYPT_TO=${ENCRYPT_TO}"
+    log "MYSQL=${MYSQL}"
+    log "MYSQLDIR=${MYSQLDIR}"
+    log "MYSQLUSER=${MYSQLUSER}"
+    log "MYSQLPASS=< not dumped >"
+    log "LIBVIRT=${LIBVIRT}"
+    log "LIBVIRTDIR=${LIBVIRTDIR}"
+}
+
+init_all () {
+
+    include_config "${BASEDIR}/${PRGNAME}.conf"
+
+    init_my_libs "$PRGNAME" "$LOGDIR" "$KEEPLOGS" "$DEBUG" "$SYSLOG"
+
+    write_pid_file "${BASEDIR}"
+
+    check_dir_exit "$BASEDIR"
+    check_dir_exit "$LOGDIR"
+    # check if backupdir exists and useful permissions are set
+    check_dir_exit "$BACKUPDIR"
+    chown 0.0 "$BACKUPDIR"
+    chmod 0700 "$BACKUPDIR"
+    # check backupdir again
+    check_dir_exit "$BACKUPDIR"
+    check_dir_exit "$BACKUPTMPDIR"
+    check_dir_exit "${BACKUPTMPDIR}/${MYSQLDIR}"
+    check_dir_exit "${BACKUPTMPDIR}/${LIBVIRTDIR}"
+
+    init_log
+
+    dump_config
+    umask 0077
+}
+
+the_end () {
+
+    log "INFO: Backup finished"
+    umask $UMASK
+    remove_pid_file "${BASEDIR}"
+    stop_log
+
+    if [ "$1" = "" ]; then
+        exit 0
+    else
+        exit $1
+    fi
+}
+
+create_final_backupfile () {
+    local BACKUPDIR="$1"
+    local BACKUPFILE="$2"
+    local MYSQLDATA="$3"
+    local MYSQLFILEPREFIX="$4"
+    local LIBVIRTDATA="$5"
+    local MYPWD="$(pwd)"
+    local ERROR=0
+    local RET=""
+
+    log "INFO: Creating final backupfile ${BACKUPDIR}/${BACKUPFILE}"
+
+    # change to backupdir
+    log "INFO: cd $BACKUPDIR"
+    cd "$BACKUPDIR"
+
+    # Create a md5sum file
+    log "INFO: Creating md5 file of "
+    md5sum ${BACKUPFILE} > ${BACKUPFILE}.md5 
+
+    log "INFO: Packing ${BACKUPFILE}, ${BACKUPFILE}.md5, ${MYSQLDATA} and ${LIBVIRTDATA} into ${BACKUPFILE}.tar"
+    tar -cf $BACKUPFILE.tar ${BACKUPFILE} ${BACKUPFILE}.md5 ${MYSQLDATA} ${LIBVIRTDATA}
+    RET="$?"
+    # exit code 1: If tar was given ‘--create’, ‘--append’ or ‘--update’ option, this exit code means that some files were changed while 
+    # being archived and so the resulting archive does not contain the exact copy of the file set.
+    # exit code 2: ‘Fatal error’. This means that some fatal, unrecoverable error occurred.
+    if [ "$RET" -eq 2 ]; then
+        ERROR=1
+        log "FATAL: tar failed: $RET" "crit"
+    elif [ "$RET" -eq 1 ]; then
+        ERROR=1
+        log "ERROR: Files ${BACKUPFILE}, ${BACKUPFILE}.md5, ${MYSQLDATA} and ${LIBVIRTDATA} changed, which are not supposed to change..." "err"
+    fi
+
+    # remove old backup files
+    rm -f ${BACKUPFILE} ${BACKUPFILE}.md5
+    RET="$?"
+    if [ "$RET" -ne 0 ]; then
+        ERROR=1
+        log "ERROR: removing files ${BACKUPFILE}, ${BACKUPFILE}.md5 failed: $RET" "err"
+    fi
+    # remove mysql backup files
+    rm -f ${MYSQLDATA}/${MYSQLFILEPREFIX}*
+    RET="$?"
+    if [ "$RET" -ne 0 ]; then
+        ERROR=1
+        log "ERROR: removing mysql backup files failed: $RET" "err"
+    fi
+    # remove libvirt backup files
+    rm -f ${LIBVIRTDATA}/domain-* ${LIBVIRTDATA}/net-* ${LIBVIRTDATA}/pool-*
+    RET="$?"
+    if [ "$RET" -ne 0 ]; then
+        ERROR=1
+        log "ERROR: removing libvirt backup files failed: $RET" "err"
+    fi
+
+    # go back
+    log "INFO: cd $MYPWD"
+    cd "$MYPWD"
+
+    return $ERROR
+}
+
+
+##################################################
+##################################################
+#
+# MAIN
+#
+##################################################
+##################################################
+
+init_all
+log "INFO: Starting Backup of $HOST"
+
+create_tgz_file "$EXCLUDE" "$BACKUPDATA" "${BACKUPTMPDIR}/${BACKUPFILE}"
+if [ "$?" -ne 0 ]; then
+    BACKUPERROR=1
+fi
+
+if [ "$MYSQL" = "YES" ]
+then
+    mysql_all_backup "$MYSQLUSER" "$MYSQLPASS" "${BACKUPTMPDIR}/${MYSQLDIR}" "$MYSQLFILEPREFIX"
+    if [ "$?" -ne 0 ]; then
+        BACKUPERROR=1
+    fi
+else
+    log "INFO: MySQL backup is deactivated"
+fi
+
+if [ "$LIBVIRT" = "YES" ]
+then
+    libvirt_backup "${BACKUPTMPDIR}/${LIBVIRTDIR}"
+    if [ "$?" -ne 0 ]; then
+        BACKUPERROR=1
+    fi
+else
+    log "INFO: libvirt backup is deactivated"
+fi
+
+create_final_backupfile "${BACKUPTMPDIR}" "${BACKUPFILE}" "$MYSQLDIR" "$MYSQLFILEPREFIX" "$LIBVIRTDIR"
+if [ "$?" -ne 0 ]; then
+    BACKUPERROR=1
+fi
+
+# set ${BACKUPFILE} to new name
+BACKUPFILE="${BACKUPFILE}.tar"
+
+#
+# Encrypt and sign that .tar file
+if [ "$ENCRYPT" = "YES" ]
+then
+    encrypt_backup_file "$ENCRYPT_TO" "${BACKUPTMPDIR}/${BACKUPFILE}"
+    if [ "$?" -ne 0 ]; then
+        BACKUPERROR=1
+    fi
+    # set ${BACKUPFILE} to new name
+    BACKUPFILE="${BACKUPFILE}.dat"
+else 
+    log "INFO: Encryption is deactivated"
+fi
+
+log "moving backup file ${BACKUPTMPDIR}/${BACKUPFILE} to $BACKUPDIR"
+mv ${BACKUPTMPDIR}/${BACKUPFILE} ${BACKUPDIR}
+RET="$?"
+if [ "$RET" -ne 0 ]; then
+    BACKUPERROR=1
+    log "ERROR: mv of $BACKUPFILE to $BACKUPDIR failed: $RET" "err"
+fi
+
+rotate_backups_by_size "${BACKUPDIR}/${BACKUPFILEPREFIX}" "$BACKUPMAXSIZE"
+if [ "$?" -ne 0 ]; then
+    BACKUPERROR=1
+fi
+
+# send report as mail if mail address is set
+if [ "$MAILTO" != "" ]; then
+    if [ "$BACKUPERROR" -eq 0 ]; then
+        mail_log "SUCCESSFUL Backup on $HOST at $BACKUPTIME" "$MAILTO"
+        if [ "$?" -ne 0 ]; then
+            BACKUPERROR=1
+        fi
+    else
+        mail_log "FAILED Backup on $HOST at $BACKUPTIME" "$MAILTO"
+        if [ "$?" -ne 0 ]; then
+            BACKUPERROR=1
+        fi
+    fi
+fi
+
+if [ "$BACKUPERROR" -ne 0 ]; then
+    the_end 1
+else
+    the_end 0
+fi
+
