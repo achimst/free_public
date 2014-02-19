@@ -1,0 +1,251 @@
+#!/bin/bash
+#
+# -------------------------------------------------------------------------
+# Copyright (c) 2013, Achim Stumpf <achim dot stumpf at gmail dot com>
+# All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions
+# are met:
+#
+# * Redistributions of source code must retain the above copyright
+#   notice, this list of conditions and the following disclaimer.
+#
+# * Redistributions in binary form must reproduce the above copyright
+#   notice, this list of conditions and the following disclaimer in 
+#   the documentation and/or other materials provided with the distribution.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+# "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+# LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+# A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+# HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+# SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+# LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+# DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+# THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+# (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+# -------------------------------------------------------------------------
+#
+BASEDIR="./"
+PRGNAME="$(basename $0)"
+BACKUPERROR=0
+BACKUPTIME=$(date "+%Y-%m-%d_%H-%M")
+TODAY=$(date "+%Y-%m-%d")
+HOST="$(/bin/hostname --fqdn)"
+
+#
+# Default configuration options which can be changed in the configuration file $PRGNAME.cfg
+: ${DEBUG="0"}
+: ${SYSLOG="1"}
+: ${KEEPLOGS="7"}
+: ${LOGDIR="$BASEDIR/logs/"}
+# mail to $MAILTO, otherwise no mail is send
+: ${MAILTO="root"}
+: ${HOSTLIST="$PRGNAME-hostlist.conf"}
+
+# include libs (see myrepos/trunk/lib/bash)
+. ${BASEDIR}/my_lib
+. ${BASEDIR}/my_lib_backup
+
+##################################################
+##################################################
+#
+# FUNCTIONS
+#
+##################################################
+##################################################
+
+dump_config () {
+    log "DEBUG=${DEBUG}"
+    log "SYSLOG=${SYSLOG}"
+    log "KEEPLOGS=${KEEPLOGS}"
+    log "LOGDIR=${LOGDIR}"
+    log "MAILTO=${MAILTO}"
+    log "HOSTLIST=${HOSTLIST}"
+}
+
+init_all () {
+
+    include_config "${BASEDIR}/${PRGNAME}.conf"
+
+    init_my_libs "$PRGNAME" "$LOGDIR" "$KEEPLOGS" "$DEBUG" "$SYSLOG"
+
+    write_pid_file "${BASEDIR}"
+
+    check_dir_exit "$BASEDIR"
+    check_dir_exit "$LOGDIR"
+
+    init_log
+
+    dump_config
+}
+
+the_end () {
+
+    log "INFO: Backup finished"
+    remove_pid_file "${BASEDIR}"
+    stop_log
+
+    if [ "$1" = "" ]; then
+        exit 0
+    else
+        exit $1
+    fi
+}
+
+copy_from_host ()
+{
+    local TODAY="$1"
+    local HOST="$2"
+    local PORT="$3"
+    local KEYFILE="$4"
+    local USER="$5"
+    local SOURCE="$6"
+    local FILEPREFIX="$7"
+    local DEST="$8"
+    local LIMIT="$9"
+    local SSHOPTS="-o PubkeyAuthentication=yes -o PasswordAuthentication=no -o StrictHostKeyChecking=no -o ConnectTimeout=60 -o ServerAliveInterval=30"
+    local FILE=""
+    local ERROR=0
+    local RET=""
+
+    log "INFO: working on ${HOST}"
+    # host online?
+    ssh $SSHOPTS -p ${PORT} -i ${KEYFILE} ${USER}@${HOST} "ls -la &> /dev/null" &> /dev/null
+    RET="$?"
+    if [ "$RET" -eq 0 ]; then
+        # get todays newest file 
+        FILE="$(ssh $SSHOPTS -p ${PORT} -i ${KEYFILE} ${USER}@${HOST} "cd ${SOURCE}/ ; ls -1 ${FILEPREFIX}*${TODAY}* | tail -n 1")"
+        RET="$?"
+        if [ "$RET" -eq 0 ]
+        then
+            # if file does not exist locally, copy it
+            if [ ! -e "${DEST}/${FILE}" ]
+            then
+                log "INFO: scp $SSHOPTS -p -i ${KEYFILE} -P ${PORT} -l ${LIMIT} ${USER}@${HOST}:${SOURCE}/${FILE} ${DEST}"
+                scp $SSHOPTS -p -i ${KEYFILE} -P ${PORT} -l ${LIMIT} ${USER}@${HOST}:${SOURCE}/${FILE} ${DEST}
+                RET="$?"
+                if [ "$RET" -ne 0 ]
+                then
+                    log "FATAL: while executing scp: $RET" "crit"
+                    ERROR=1
+                fi
+            else
+                log "INFO: file ${DEST}/${FILE} already exists, nothing to do..."
+            fi
+        else
+            log "ERROR: file ${HOST}:${SOURCE}/${FILEPREFIX}*${TODAY}* not found: $RET" "err"
+            ERROR=1
+        fi
+    else
+        log "FATAL: host $HOST is not online: $RET" "crit"
+        ERROR=1
+    fi
+
+    return $ERROR
+}
+
+work_on_hosts () {
+    local HOSTLIST="$1"
+    local TODAY="$2"
+    local LINE=""
+    local FIELD=""
+    local HOSTPARA=""
+    local NUM=0
+    local RET=""
+    local ERROR=0
+
+    #
+    # read each configuration line and work on that host
+    exec 9< $HOSTLIST
+    while read -u 9 LINE
+    do
+        # if line is a comment then continue
+        echo $LINE | grep '^[[:space:]]*#'  &> /dev/null
+        RET="$?"
+        if [ "$RET" -eq 0 ]; then
+            continue
+        fi
+
+        # check if it is a valid configuration line
+        #         HOSTPARA  1 host          2 port  3 keyfile      4 user        5 source-dir  6 file-prefix  7 dest-dir     8 limit in kbit/s 9 max-size
+        echo $LINE | grep '^[a-zA-Z0-9.-]\+;[0-9]\+;[/a-zA-Z._-]\+;[a-zA-Z._-]\+;[/a-zA-Z._-]\+;[a-zA-Z._-]\+;[/a-zA-Z0-9._-]\+;[0-9]\+;[0-9]\+[[:space:]]*$' &> /dev/null
+        RET="$?"
+        # otherwise read the next line
+        if [ "$RET" -ne 0 ]
+        then
+            ERROR=1
+            log "ERROR: invalid line in $HOSTLIST: $LINE" "err"
+            continue
+        fi
+
+        # get the host parameters 
+        NUM=0
+        for FIELD in $(echo $LINE | sed 's/;/ /g')
+        do
+            ((NUM++))
+            HOSTPARA[$NUM]="$FIELD"
+        done
+
+        copy_from_host "$TODAY" "${HOSTPARA[1]}" "${HOSTPARA[2]}" "${HOSTPARA[3]}" "${HOSTPARA[4]}" "${HOSTPARA[5]}" "${HOSTPARA[6]}" "${HOSTPARA[7]}" "${HOSTPARA[8]}"
+        RET="$?"
+        if [ "$RET" -ne 0 ]; then
+            ERROR=1
+        fi
+
+        rotate_backups_by_size "${HOSTPARA[7]}/${HOSTPARA[6]}" "${HOSTPARA[9]}"
+        RET="$?"
+        if [ "$RET" -ne 0 ]; then
+            ERROR=1
+        fi
+
+    done 
+    # free the file descriptor
+    exec 9<&- 
+
+    return $ERROR
+}
+
+##################################################
+##################################################
+#
+# MAIN
+#
+##################################################
+##################################################
+
+init_all
+log "INFO: Starting Backup of remote hosts"
+
+# check that hostfile exists and size is greater than zero
+if [ ! -s "$HOSTLIST" ]; then
+    BACKUPERROR=1
+    log "FATAL: hostlist file $HOSTLIST not found or is empty" "crit"
+fi
+
+if [ "$BACKUPERROR" -eq 0 ]; then
+    work_on_hosts "$HOSTLIST" "$TODAY"
+    if [ "$?" -ne 0 ]; then
+        BACKUPERROR=1
+    fi
+fi
+
+# send report as mail if mail address is set
+if [ "$MAILTO" != "" ]; then
+    if [ "$BACKUPERROR" -eq 0 ]; then
+        mail_log "SUCCESSFUL fetching of backups on $HOST at $BACKUPTIME" "$MAILTO"
+        if [ "$?" -ne 0 ]; then
+            BACKUPERROR=1
+        fi
+    else
+        mail_log "FAILED fetching backups on $HOST at $BACKUPTIME" "$MAILTO"
+        if [ "$?" -ne 0 ]; then
+            BACKUPERROR=1
+        fi
+    fi
+fi
+
+the_end $BACKUPERROR
+
